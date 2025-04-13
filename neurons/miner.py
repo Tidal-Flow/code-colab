@@ -23,12 +23,12 @@ import asyncio
 import tempfile
 import subprocess
 import bittensor as bt
-import psycopg2
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Code Collaboration Subnet
 import ocr_subnet as code_subnet
+from ocr_subnet.utils.storage import JSONStorage
 
 # Import base miner class which takes care of most of the boilerplate
 from ocr_subnet.base.miner import BaseMinerNeuron
@@ -49,8 +49,8 @@ class Miner(BaseMinerNeuron):
         os.makedirs(self.repo_dir, exist_ok=True)
         bt.logging.info(f"Repository directory initialized at: {self.repo_dir}")
         
-        # Initialize database connection for tracking repositories and challenges
-        self.setup_database()
+        # Initialize storage for tracking repositories and challenges
+        self.setup_storage()
         
         # Verify Git is installed and working
         try:
@@ -60,51 +60,16 @@ class Miner(BaseMinerNeuron):
             bt.logging.error(f"Git installation error: {e}. Please ensure Git is installed.")
             raise RuntimeError("Git must be installed to run the Code Collaboration Miner")
         
-    def setup_database(self):
-        """Set up a local database to track repositories and challenges"""
+    def setup_storage(self):
+        """Set up JSON storage for tracking repositories and challenges"""
         try:
-            self.conn = psycopg2.connect(
-                dbname=self.config.database.name,
-                user=self.config.database.user,
-                password=self.config.database.password,
-                host=self.config.database.host,
-                port=self.config.database.port
-            )
-            bt.logging.info("Database connection established")
-            
-            # Create repositories table
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS repositories (
-                    repo_id SERIAL PRIMARY KEY,
-                    repo_url TEXT UNIQUE NOT NULL,
-                    local_path TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create challenges table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS challenges (
-                    challenge_id TEXT PRIMARY KEY,
-                    repo_url TEXT NOT NULL,
-                    challenge_type TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    base_branch TEXT NOT NULL,
-                    solution_branch TEXT,
-                    status TEXT DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    FOREIGN KEY (repo_url) REFERENCES repositories(repo_url)
-                )
-            """)
-            
-            self.conn.commit()
-            cursor.close()
+            # Create storage directory
+            storage_dir = os.path.join(self.repo_dir, "storage")
+            self.storage = JSONStorage(storage_dir)
+            bt.logging.info(f"JSON storage initialized at: {storage_dir}")
         except Exception as e:
-            bt.logging.error(f"Database connection failed: {e}")
-            self.conn = None
+            bt.logging.error(f"Storage initialization failed: {e}")
+            self.storage = None
 
     async def forward(self, synapse: typing.Union[
         code_subnet.protocol.GitCloneSynapse,
@@ -140,7 +105,7 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"Received clone request for: {synapse.repo_url}")
         
         try:
-            # Check if repo already exists in our database
+            # Check if repo already exists in our storage
             repo_path = self._get_repo_path(synapse.repo_url)
             
             if not repo_path:
@@ -238,32 +203,22 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"Received challenge request: {synapse.challenge_id} for repo: {synapse.repo_url}")
         
         try:
-            # Store challenge in database
-            if self.conn:
-                cursor = self.conn.cursor()
+            # Store challenge in storage
+            if self.storage:
                 # Check if repo exists, if not add it
-                cursor.execute("SELECT repo_url FROM repositories WHERE repo_url = %s", (synapse.repo_url,))
-                if not cursor.fetchone():
+                repo_path = self._get_repo_path(synapse.repo_url)
+                if not repo_path:
                     repo_path = self._clone_repository(synapse.repo_url)
-                    cursor.execute(
-                        "INSERT INTO repositories (repo_url, local_path) VALUES (%s, %s)",
-                        (synapse.repo_url, repo_path)
-                    )
                 
-                # Insert challenge
-                cursor.execute(
-                    """
-                    INSERT INTO challenges 
-                    (challenge_id, repo_url, challenge_type, description, base_branch, status) 
-                    VALUES (%s, %s, %s, %s, %s, 'accepted')
-                    ON CONFLICT (challenge_id) DO UPDATE SET 
-                    status = 'accepted', completed_at = NULL
-                    """,
-                    (synapse.challenge_id, synapse.repo_url, synapse.challenge_type, 
-                     synapse.description, synapse.base_branch)
+                # Store challenge information
+                self.storage.store_challenge(
+                    challenge_id=synapse.challenge_id,
+                    repo_url=synapse.repo_url,
+                    challenge_type=synapse.challenge_type,
+                    description=synapse.description,
+                    base_branch=synapse.base_branch,
+                    expiry_at=(datetime.now() + timedelta(hours=24)).isoformat()
                 )
-                self.conn.commit()
-                cursor.close()
             
             # Create a solution branch for this challenge
             repo_path = self._get_repo_path(synapse.repo_url)
@@ -291,29 +246,20 @@ class Miner(BaseMinerNeuron):
     
     def _get_repo_path(self, repo_url):
         """Get the local path for a repository"""
-        if self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT local_path FROM repositories WHERE repo_url = %s", (repo_url,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if result:
-                return result[0]
-        
-        # If not in database, check if we can find it by URL hash
+        if self.storage:
+            # Try to get from storage
+            path = self.storage.get_repository_path(repo_url)
+            if path:
+                return path
+                
+        # If not in storage, check if we can find it by URL hash
         repo_hash = self._hash_repo_url(repo_url)
         repo_path = os.path.join(self.repo_dir, repo_hash)
         
         if os.path.exists(repo_path) and os.path.isdir(repo_path):
-            # Add to database if found
-            if self.conn:
-                cursor = self.conn.cursor()
-                cursor.execute(
-                    "INSERT INTO repositories (repo_url, local_path) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                    (repo_url, repo_path)
-                )
-                self.conn.commit()
-                cursor.close()
+            # Add to storage if found
+            if self.storage:
+                self.storage.store_repository(repo_url, repo_path)
             return repo_path
             
         return None
@@ -340,15 +286,9 @@ class Miner(BaseMinerNeuron):
             check=True, capture_output=True, text=True
         )
         
-        # Add to database
-        if self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "INSERT INTO repositories (repo_url, local_path) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                (repo_url, repo_path)
-            )
-            self.conn.commit()
-            cursor.close()
+        # Add to storage
+        if self.storage:
+            self.storage.store_repository(repo_url, repo_path)
             
         return repo_path
     
