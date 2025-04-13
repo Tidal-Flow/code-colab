@@ -26,13 +26,14 @@ import asyncio
 import subprocess
 import numpy as np
 import bittensor as bt
-import psycopg2
+import torch
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Tuple, Optional, Union
 
 # Import the code collaboration subnet module
 import ocr_subnet as code_subnet
+from ocr_subnet.utils.storage import JSONStorage
 
 # import base validator class which takes care of most of the boilerplate
 from ocr_subnet.base.validator import BaseValidatorNeuron
@@ -58,8 +59,8 @@ class Validator(BaseValidatorNeuron):
         os.makedirs(self.repo_dir, exist_ok=True)
         bt.logging.info(f"Repository directory initialized at: {self.repo_dir}")
             
-        # Set up database connection
-        self.setup_database()
+        # Set up JSON storage instead of database
+        self.setup_storage()
         
         # Verify Git is installed and working
         try:
@@ -76,53 +77,17 @@ class Validator(BaseValidatorNeuron):
         # Ensure we have at least one repository for challenges
         if not self.challenge_repos or len(self.challenge_repos) == 0:
             bt.logging.warning("No challenge repositories specified - validator may not function correctly")
-            
-    def setup_database(self):
-        """Set up a database connection for tracking challenges and submissions"""
+        
+    def setup_storage(self):
+        """Set up JSON storage for tracking challenges and submissions"""
         try:
-            self.conn = psycopg2.connect(
-                dbname=self.config.database.name,
-                user=self.config.database.user,
-                password=self.config.database.password,
-                host=self.config.database.host,
-                port=self.config.database.port
-            )
-            bt.logging.info("Database connection established")
-            
-            # Create challenges table
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS challenges (
-                    challenge_id TEXT PRIMARY KEY,
-                    repo_url TEXT NOT NULL,
-                    challenge_type TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    base_branch TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expiry_at TIMESTAMP
-                )
-            """)
-            
-            # Create submissions table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS submissions (
-                    submission_id TEXT PRIMARY KEY,
-                    challenge_id TEXT NOT NULL,
-                    hotkey TEXT NOT NULL,
-                    solution_branch TEXT NOT NULL,
-                    score FLOAT,
-                    test_results JSONB,
-                    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    evaluated_at TIMESTAMP,
-                    FOREIGN KEY (challenge_id) REFERENCES challenges(challenge_id)
-                )
-            """)
-            
-            self.conn.commit()
-            cursor.close()
+            # Create storage directory
+            storage_dir = os.path.join(self.repo_dir, "storage")
+            self.storage = JSONStorage(storage_dir)
+            bt.logging.info(f"JSON storage initialized at: {storage_dir}")
         except Exception as e:
-            bt.logging.error(f"Database connection failed: {e}")
-            self.conn = None
+            bt.logging.error(f"Storage initialization failed: {e}")
+            self.storage = None
 
     async def forward(self):
         """
@@ -156,7 +121,7 @@ class Validator(BaseValidatorNeuron):
         
         # Select a subset of miners to challenge
         miner_uids = code_subnet.utils.uids.get_random_uids(
-            self,
+            self, 
             k=min(self.config.neuron.sample_size, self.metagraph.n.item())
         )
         
@@ -191,26 +156,17 @@ class Validator(BaseValidatorNeuron):
         
         challenge_description = self._generate_challenge_description(repo_path, challenge_type)
         
-        # Store challenge in database
-        if self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO challenges 
-                (challenge_id, repo_url, challenge_type, description, base_branch, expiry_at) 
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    challenge_id, 
-                    repo_url, 
-                    challenge_type, 
-                    challenge_description, 
-                    base_branch,
-                    datetime.now() + timedelta(hours=24)  # Expire in 24 hours
-                )
+        # Store challenge in JSON storage
+        if self.storage:
+            expiry_time = (datetime.now() + timedelta(hours=24)).isoformat()
+            self.storage.store_challenge(
+                challenge_id=challenge_id,
+                repo_url=repo_url,
+                challenge_type=challenge_type,
+                description=challenge_description,
+                base_branch=base_branch,
+                expiry_at=expiry_time
             )
-            self.conn.commit()
-            cursor.close()
         
         # Create synapse with challenge details
         synapse = code_subnet.protocol.GitChallengeSynapse(
@@ -238,24 +194,14 @@ class Validator(BaseValidatorNeuron):
             if response.get("status") == "accepted":
                 bt.logging.info(f"Miner {miner_uids[i]} accepted challenge with solution branch: {response.get('solution_branch')}")
                 
-                # Record acceptance in database
-                if self.conn:
-                    cursor = self.conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO submissions
-                        (submission_id, challenge_id, hotkey, solution_branch)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            challenge_id,
-                            self.metagraph.hotkeys[miner_uids[i]],
-                            response.get("solution_branch")
-                        )
+                # Record acceptance in JSON storage
+                if self.storage:
+                    self.storage.store_submission(
+                        submission_id=str(uuid.uuid4()),
+                        challenge_id=challenge_id,
+                        hotkey=self.metagraph.hotkeys[miner_uids[i]],
+                        solution_branch=response.get("solution_branch")
                     )
-                    self.conn.commit()
-                    cursor.close()
             else:
                 bt.logging.warning(f"Miner {miner_uids[i]} did not accept challenge: {response}")
     
@@ -264,24 +210,12 @@ class Validator(BaseValidatorNeuron):
         bt.logging.info("Evaluating miner solutions")
         
         # Check if we have any pending submissions to evaluate
-        if not self.conn:
-            bt.logging.warning("No database connection available")
+        if not self.storage:
+            bt.logging.warning("No storage available")
             return
             
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT s.submission_id, s.challenge_id, s.hotkey, s.solution_branch, c.repo_url
-            FROM submissions s
-            JOIN challenges c ON s.challenge_id = c.challenge_id
-            WHERE s.score IS NULL AND c.expiry_at > NOW()
-            LIMIT %s
-            """,
-            (self.config.validator.batch_size,)
-        )
-        
-        submissions = cursor.fetchall()
-        cursor.close()
+        # Get pending submissions from storage
+        submissions = self.storage.get_pending_submissions(self.config.validator.batch_size)
         
         if not submissions:
             bt.logging.info("No pending submissions to evaluate")
@@ -290,7 +224,13 @@ class Validator(BaseValidatorNeuron):
         bt.logging.info(f"Found {len(submissions)} submissions to evaluate")
         
         # Process each submission
-        for submission_id, challenge_id, hotkey, solution_branch, repo_url in submissions:
+        for submission in submissions:
+            submission_id = submission["submission_id"]
+            challenge_id = submission["challenge_id"]
+            hotkey = submission["hotkey"]
+            solution_branch = submission["solution_branch"]
+            repo_url = submission["repo_url"]
+            
             bt.logging.info(f"Evaluating submission {submission_id} from {hotkey}")
             
             # Get UID for this hotkey
@@ -334,18 +274,12 @@ class Validator(BaseValidatorNeuron):
             # Calculate score based on validation results
             score = self._calculate_solution_score(validation_result)
             
-            # Update submission with score and test results
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                UPDATE submissions
-                SET score = %s, test_results = %s, evaluated_at = NOW()
-                WHERE submission_id = %s
-                """,
-                (score, json.dumps(validation_result), submission_id)
+            # Update submission with score and test results in storage
+            self.storage.update_submission_score(
+                submission_id=submission_id,
+                score=score,
+                test_results=validation_result
             )
-            self.conn.commit()
-            cursor.close()
             
             bt.logging.info(f"Scored submission {submission_id} with score {score}")
     
@@ -353,23 +287,12 @@ class Validator(BaseValidatorNeuron):
         """Update miner scores based on their submissions"""
         bt.logging.info("Updating miner scores")
         
-        if not self.conn:
-            bt.logging.warning("No database connection available")
+        if not self.storage:
+            bt.logging.warning("No storage available")
             return
             
         # Get average scores for each miner from evaluated submissions
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT hotkey, AVG(score) as avg_score
-            FROM submissions
-            WHERE evaluated_at IS NOT NULL AND score IS NOT NULL
-            GROUP BY hotkey
-            """
-        )
-        
-        miner_scores = cursor.fetchall()
-        cursor.close()
+        miner_scores = self.storage.get_average_scores_by_hotkey()
         
         if not miner_scores:
             bt.logging.info("No scored submissions found")
@@ -379,7 +302,7 @@ class Validator(BaseValidatorNeuron):
         updated_scores = torch.zeros_like(self.metagraph.S, dtype=torch.float32)
         
         # Update scores for miners with evaluations
-        for hotkey, avg_score in miner_scores:
+        for hotkey, avg_score in miner_scores.items():
             try:
                 uid = self.metagraph.hotkeys.index(hotkey)
                 updated_scores[uid] = float(avg_score)
@@ -392,7 +315,7 @@ class Validator(BaseValidatorNeuron):
         min_score = 0.1  # Minimum score for active miners
         mask = torch.zeros_like(updated_scores)
         for uid in range(len(self.metagraph.hotkeys)):
-            if self.metagraph.hotkeys[uid] in [hotkey for hotkey, _ in miner_scores]:
+            if self.metagraph.hotkeys[uid] in miner_scores:
                 mask[uid] = 1
             elif self.metagraph.axons[uid].is_serving:
                 mask[uid] = min_score
@@ -512,39 +435,20 @@ class Validator(BaseValidatorNeuron):
     
     def _get_repo_path(self, repo_url: str) -> Optional[str]:
         """Get the local path for a repository"""
-        if self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                SELECT local_path FROM repositories 
-                WHERE repo_url = %s
-                """, 
-                (repo_url,)
-            )
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if result:
-                return result[0]
+        if self.storage:
+            # Try to get from storage first
+            path = self.storage.get_repository_path(repo_url)
+            if path:
+                return path
         
-        # If not in database, check if we can find it by URL hash
+        # If not in storage, check if we can find it by URL hash
         repo_hash = self._hash_repo_url(repo_url)
         repo_path = os.path.join(self.repo_dir, repo_hash)
         
         if os.path.exists(repo_path) and os.path.isdir(repo_path):
-            # Add to database if found
-            if self.conn:
-                cursor = self.conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO repositories (repo_url, local_path) 
-                    VALUES (%s, %s) 
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (repo_url, repo_path)
-                )
-                self.conn.commit()
-                cursor.close()
+            # Add to storage if found
+            if self.storage:
+                self.storage.store_repository(repo_url, repo_path)
             return repo_path
             
         return None
@@ -568,19 +472,9 @@ class Validator(BaseValidatorNeuron):
             check=True, capture_output=True, text=True
         )
         
-        # Add to database
-        if self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO repositories (repo_url, local_path) 
-                VALUES (%s, %s) 
-                ON CONFLICT DO NOTHING
-                """,
-                (repo_url, repo_path)
-            )
-            self.conn.commit()
-            cursor.close()
+        # Add to storage
+        if self.storage:
+            self.storage.store_repository(repo_url, repo_path)
             
         return repo_path
     
