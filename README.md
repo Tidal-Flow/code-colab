@@ -91,7 +91,7 @@ As described in [this section of Bittensor Subnet Template](https://github.com/o
 2. `neurons/miner.py`: Script that defines the subnet miner's behavior, i.e., how the subnet miner responds to requests from subnet validators.
 3. `neurons/validator.py`: This script defines the subnet validator's behavior, i.e., how the subnet validator requests information from the subnet miners and determines the scores.
 
-Below we show the changes we made to this OCR subnet repo. You can use your preferred names, but ensure that your code is consistent with the names you use.
+Below we show the changes we made to this OCR subnet repo. You can use your preferred names, but ensure that your code is consistent with the names you use.
 
 - Renamed `/template` to `/ocr_subnet`.
 - `ocr_subnet/protocol.py`: Renamed the synapse to `OCRSynapse` and provided the necessary attributes to communication between miner and validator.
@@ -152,3 +152,181 @@ This repository is licensed under the MIT License.
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 ```
+
+# Code Collaboration Subnet
+
+A Git-based, collaborative code development subnet for Bittensor.
+
+## Overview
+
+The Code Collaboration Subnet transforms Bittensor into a decentralized GitHub-like ecosystem where:
+
+- **Miners host Git repositories** and respond to Git operations (clone, fetch, push) while also solving code challenges
+- **Validators issue code challenges** and evaluate the quality of miners' submissions
+
+The subnet provides a distributed mechanism for code collaboration, evaluation, and incentivization, leveraging Bittensor's Yuma Consensus to reward participants based on the quality of their code contributions.
+
+## Architecture
+
+### Subnet Roles
+
+#### Miners as Git Servers
+
+Miners in this subnet function as Git servers, with the following capabilities:
+
+- Host one or more Git repositories
+- Respond to clone and fetch requests with the latest commits/refs
+- Accept push operations for new branches or commits
+- Implement solutions to code challenges issued by validators
+
+#### Validators as Git Clients
+
+Validators function as Git clients that:
+
+- Clone repositories at specific commits
+- Issue code challenges (features, bugfixes, refactoring tasks)
+- Run CI pipelines, static analysis, and lint checks on miner submissions
+- Score submissions based on code quality, test success, and code coverage
+
+### Protocol & Communication
+
+All communication between miners and validators happens through specialized Synapse objects:
+
+- `GitCloneSynapse`: Used for repository cloning operations
+- `GitFetchSynapse`: Used for fetching updates from a repository
+- `GitPushSynapse`: Used for pushing changes to a repository
+- `GitChallengeSynapse`: Used by validators to issue coding challenges
+- `GitValidationSynapse`: Used for validating and scoring solutions
+
+### Challenge & Incentive Flow
+
+1. **Challenge Generation**
+   - Validator selects a repository and commit
+   - Issues a challenge (e.g., "Implement feature X") via a `GitChallengeSynapse`
+
+2. **Miner Submission**
+   - Miner clones the repo, modifies code to meet the challenge
+   - Runs local tests and pushes back a branch with their solution
+
+3. **Validation & Scoring**
+   - Validators test and analyze miner submissions
+   - Score from 0-100 based on:
+     - Tests passing (20 points)
+     - Code quality/static analysis (15 points)
+     - Linting (15 points)
+     - Base points (50 points for valid submissions)
+
+4. **On-Chain Integration**
+   - Validator submits scores on-chain
+   - Bittensor's Yuma Consensus updates weights and allocates TAO rewards
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.8+
+- Git
+- PostgreSQL
+- Bittensor
+
+### Installation
+
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/username/code-collaboration-subnet.git
+   cd code-collaboration-subnet
+   ```
+
+2. Install dependencies:
+   ```bash
+   pip install -e .
+   ```
+
+3. Set up PostgreSQL database:
+   ```bash
+   createdb code_collaboration_subnet
+   ```
+
+### Configuration
+
+Configure your subnet by modifying the `config.yaml` file:
+
+```yaml
+# Miner settings
+miner:
+  repo_directory: "~/miner_repos"
+
+# Validator settings
+validator:
+  repo_directory: "~/validator_repos"
+  challenge_repos: "https://github.com/org/repo1,https://github.com/org/repo2"
+  batch_size: 5
+
+# Database settings
+database:
+  name: "code_collaboration_subnet"
+  user: "postgres"
+  password: "your_password"
+  host: "localhost"
+  port: 5432
+```
+
+### Running a Miner
+
+```bash
+python neurons/miner.py --subtensor.network <network> --wallet.name <wallet> --wallet.hotkey <hotkey>
+```
+
+### Running a Validator
+
+```bash
+python neurons/validator.py --subtensor.network <network> --wallet.name <wallet> --wallet.hotkey <hotkey>
+```
+
+## Subnet Lifecycle
+
+1. **Repository Management**
+   - Miners automatically clone specified repositories
+   - Updates are fetched regularly to keep repositories current
+
+2. **Challenge Cycle**
+   - Validators issue code challenges to random miners
+   - Miners accept challenges and develop solutions
+   - Solutions are submitted as branches
+   - Validators score solutions and update weights
+
+3. **Scoring System**
+   - Code quality scores are normalized to a 0-1 range
+   - The Yuma Consensus mechanism distributes TAO rewards based on these normalized scores
+
+## Development
+
+### Adding New Challenge Types
+
+To add new challenge types:
+
+1. Update the `_generate_challenge_description` method in `validator.py`
+2. Add templates for the new challenge type
+3. Implement the validation logic in the `_calculate_solution_score` method
+
+### Custom Git Integrations
+
+For special Git operations:
+
+1. Add a new Synapse type in `protocol.py`
+2. Implement handler methods in the miner class
+3. Add client code in the validator class
+
+## License
+
+MIT License - see the LICENSE file for details.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
