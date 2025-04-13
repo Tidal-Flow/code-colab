@@ -20,14 +20,7 @@ validator:
   challenge_repos: "https://github.com/pytorch/pytorch,https://github.com/tensorflow/tensorflow,https://github.com/huggingface/transformers"  # Comma-separated list of challenge repositories
   batch_size: 5                        # Number of submissions to evaluate in one batch
   evaluation_timeout: 300              # Timeout for evaluation operations
-
-# Database settings
-database:
-  name: "code_collaboration_subnet"
-  user: "postgres"
-  password: ""  # Set your password in environment variables
-  host: "localhost"
-  port: 5432
+  storage_dir: "storage"               # Directory for JSON storage files (relative to repo_directory)
 
 # Logging settings
 logging:
