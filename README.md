@@ -226,7 +226,6 @@ All communication between miners and validators happens through specialized Syna
 
 - Python 3.8+
 - Git
-- PostgreSQL
 - Bittensor
 
 ### Installation
@@ -242,10 +241,14 @@ All communication between miners and validators happens through specialized Syna
    pip install -e .
    ```
 
-3. Set up PostgreSQL database:
-   ```bash
-   createdb code_collaboration_subnet
-   ```
+### Storage System
+
+The subnet uses a simple yet robust JSON file-based storage system to track:
+- Challenge information and status
+- Submissions and their evaluation results
+- Repository paths and metadata
+
+This file-based approach eliminates database dependencies, making the subnet easier to deploy and maintain. The JSON files are stored in a designated directory and include file locking to prevent concurrent access issues.
 
 ### Configuration
 
@@ -261,14 +264,7 @@ validator:
   repo_directory: "~/validator_repos"
   challenge_repos: "https://github.com/org/repo1,https://github.com/org/repo2"
   batch_size: 5
-
-# Database settings
-database:
-  name: "code_collaboration_subnet"
-  user: "postgres"
-  password: "your_password"
-  host: "localhost"
-  port: 5432
+  storage_dir: "storage"  # Directory for JSON storage files
 ```
 
 ### Running a Miner
@@ -300,6 +296,15 @@ python neurons/validator.py --subtensor.network <network> --wallet.name <wallet>
    - The Yuma Consensus mechanism distributes TAO rewards based on these normalized scores
 
 ## Development
+
+### Storage System Implementation
+
+The JSON storage system consists of three main files:
+- `challenges.json`: Stores all challenge details and their status
+- `submissions.json`: Records submissions, scores, and evaluation results
+- `repositories.json`: Tracks repository locations and metadata
+
+The system includes file locking to prevent data corruption during concurrent access and automatic creation of storage files when they don't exist.
 
 ### Adding New Challenge Types
 
