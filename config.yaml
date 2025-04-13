@@ -1,0 +1,44 @@
+# Code Collaboration Subnet Configuration
+
+# Neuron settings
+neuron:
+  sample_size: 10  # Number of miners to sample per operation
+  timeout: 60       # Timeout for RPC calls in seconds
+  epoch_length: 100 # Blocks per epoch
+  num_concurrent_forwards: 1  # Number of concurrent forwards to run
+  axon_off: False   # Whether to disable the axon (validator only)
+
+# Miner settings
+miner:
+  repo_directory: "~/miner_repos"  # Directory to store repositories
+  max_repositories: 20             # Maximum number of repositories to host
+  challenge_timeout: 3600          # Time (in seconds) to solve a challenge
+  
+# Validator settings
+validator:
+  repo_directory: "~/validator_repos"  # Directory to store repositories
+  challenge_repos: "https://github.com/pytorch/pytorch,https://github.com/tensorflow/tensorflow,https://github.com/huggingface/transformers"  # Comma-separated list of challenge repositories
+  batch_size: 5                        # Number of submissions to evaluate in one batch
+  evaluation_timeout: 300              # Timeout for evaluation operations
+
+# Database settings
+database:
+  name: "code_collaboration_subnet"
+  user: "postgres"
+  password: ""  # Set your password in environment variables
+  host: "localhost"
+  port: 5432
+
+# Logging settings
+logging:
+  debug: False
+  trace: False
+  
+# Subtensor network settings
+subtensor:
+  network: "test"  # or "main" for mainnet
+  chain_endpoint: "ws://127.0.0.1:9944"  # Local subtensor endpoint
+
+# Axon settings
+axon:
+  port: 8091 
