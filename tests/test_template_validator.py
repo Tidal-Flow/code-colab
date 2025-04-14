@@ -24,11 +24,11 @@ import bittensor as bt
 from neurons.validator import Neuron as Validator
 from neurons.miner import Neuron as Miner
 
-from ocr_subnet.protocol import Dummy
-from ocr_subnet.validator.forward import forward
-from ocr_subnet.utils.uids import get_random_uids
-from ocr_subnet.validator.reward import get_rewards
-from ocr_subnet.base.validator import BaseValidatorNeuron
+from code_colab.protocol import Dummy
+from code_colab.validator.forward import forward
+from code_colab.utils.uids import get_random_uids
+from code_colab.validator.reward import get_rewards
+from code_colab.base.validator import BaseValidatorNeuron
 
 
 class TemplateValidatorNeuronTestCase(unittest.TestCase):

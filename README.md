@@ -68,12 +68,12 @@ Each subnet consists of:
 Read the [OCR Subnet Tutorial](https://docs.bittensor.com/tutorials/ocr-subnet-tutorial) first. Then follow the below steps when you are ready to create your own OCR Subnet repo.
 
 1. Go to [Bittensor Subnet Template](https://github.com/opentensor/bittensor-subnet-template) and click on the **Use this template** dropdown on the top right. 
-2. Click on **Create a new repository** and give your preferred name in the **Repository name** field. We will use the name **ocr_subnet** in this tutorial. 
+2. Click on **Create a new repository** and give your preferred name in the **Repository name** field. We will use the name **code_colab** in this tutorial. 
 3. Optionally provide a description in the **Description** field. 
 4. Choose either **Public** or **Private**.
 5. Click on **Create repository**.
-6. GitHub will now show you your **ocr_subnet** repository page. 
-7. Clone your **ocr_subnet** repo locally.
+6. GitHub will now show you your **code_colab** repository page. 
+7. Clone your **code_colab** repo locally.
 
 ---
 
@@ -93,10 +93,10 @@ As described in [this section of Bittensor Subnet Template](https://github.com/o
 
 Below we show the changes we made to this OCR subnet repo. You can use your preferred names, but ensure that your code is consistent with the names you use.
 
-- Renamed `/template` to `/ocr_subnet`.
-- `ocr_subnet/protocol.py`: Renamed the synapse to `OCRSynapse` and provided the necessary attributes to communication between miner and validator.
-- `ocr_subnet/forward.py`: Included the synthetic data generation (invoice pdf) and used `OCRSynapse`. 
-- `ocr_subnet/reward.py`: Added custom loss function to calculate the reward.
+- Renamed `/template` to `/code_colab`.
+- `code_colab/protocol.py`: Renamed the synapse to `OCRSynapse` and provided the necessary attributes to communication between miner and validator.
+- `code_colab/forward.py`: Included the synthetic data generation (invoice pdf) and used `OCRSynapse`. 
+- `code_colab/reward.py`: Added custom loss function to calculate the reward.
 - `neurons/miner.py`: Used `pytesseract` for OCR, and used `OCRSynapse` to communicate with validator.
 
 **Additional changes**
@@ -104,7 +104,7 @@ Below we show the changes we made to this OCR subnet repo. You can use your pref
 In addition, make a note to update the following files:
 - `README.md`: This file contains the documentation for the OCR project. 
 - `contrib/CONTRIBUTING.md` and other files in `contrib`: Contains the instructions for contributing to your project. Update this file and the directory to reflect your project's contribution guidelines.
-- `ocr_subnet/__init__.py`: This file contains the version of your project.
+- `code_colab/__init__.py`: This file contains the version of your project.
 - `setup.py`: This file contains the metadata about your project. Update this file to reflect your project's metadata.
 
 ---
@@ -155,183 +155,88 @@ This repository is licensed under the MIT License.
 
 # Code Collaboration Subnet
 
-A Git-based, collaborative code development subnet for Bittensor.
+A Bittensor subnet for collaborative coding using Git servers.
 
-## Overview
+## Architecture & Data Flow
 
-The Code Collaboration Subnet transforms Bittensor into a decentralized GitHub-like ecosystem where:
+### Miners ↔ Git Servers
 
-- **Miners host Git repositories** and respond to Git operations (clone, fetch, push) while also solving code challenges
-- **Validators issue code challenges** and evaluate the quality of miners' submissions
+Each miner runs an Axon server exposing a Git endpoint via HTTP/Git protocol.
 
-The subnet provides a distributed mechanism for code collaboration, evaluation, and incentivization, leveraging Bittensor's Yuma Consensus to reward participants based on the quality of their code contributions.
+- Repositories are hosted locally on disk, backed by pygit2 and native Git
+- Miners respond to clone/fetch/push operations by streaming commit objects, refs, and accepting new branches or pull requests
+- Upon validator connection, the miner's Axon creates a folder named after the validator's hotkey; all tasks from that validator live under subfolders for isolation and audit
 
-## Architecture
+### Validators ↔ Git Clients
 
-### Subnet Roles
+Each validator runs a Dendrite client that issues Git commands to connected miners:
 
-#### Miners as Git Servers
+- Clone repositories to verify full history
+- Fetch updates to check latency and completeness
+- Push test commits or pull requests to validate write performance and integrity
+- Validators score miners on each operation, producing a performance vector that feeds into the subnet's scoring model
 
-Miners in this subnet function as Git servers, with the following capabilities:
+This mirrors a typical Bittensor "challenge–response" cycle: the validator issues a "challenge" (a Git operation), the miner "responds" (executes it), and the validator scores the result.
 
-- Host one or more Git repositories
-- Respond to clone and fetch requests with the latest commits/refs
-- Accept push operations for new branches or commits
-- Implement solutions to code challenges issued by validators
+## Incentive Mechanism
 
-#### Validators as Git Clients
+The scoring model aligns miner behavior with desired outcomes (reliable, high-performance Git hosting).
 
-Validators function as Git clients that:
+### Validator Scoring Criteria
 
-- Clone repositories at specific commits
-- Issue code challenges (features, bugfixes, refactoring tasks)
-- Run CI pipelines, static analysis, and lint checks on miner submissions
-- Score submissions based on code quality, test success, and code coverage
+- **Availability**: Uptime during CRUD tests
+- **Latency**: Time to complete clone/fetch/push
+- **Integrity**: Hash-level consistency of commits and refs
+- **Throughput**: Bandwidth sustained during large transfers
+- **Security**: Proper TLS certificates, auth checks on pushes
 
-### Protocol & Communication
+## Setup and Installation
 
-All communication between miners and validators happens through specialized Synapse objects:
-
-- `GitCloneSynapse`: Used for repository cloning operations
-- `GitFetchSynapse`: Used for fetching updates from a repository
-- `GitPushSynapse`: Used for pushing changes to a repository
-- `GitChallengeSynapse`: Used by validators to issue coding challenges
-- `GitValidationSynapse`: Used for validating and scoring solutions
-
-### Challenge & Incentive Flow
-
-1. **Challenge Generation**
-   - Validator selects a repository and commit
-   - Issues a challenge (e.g., "Implement feature X") via a `GitChallengeSynapse`
-
-2. **Miner Submission**
-   - Miner clones the repo, modifies code to meet the challenge
-   - Runs local tests and pushes back a branch with their solution
-
-3. **Validation & Scoring**
-   - Validators test and analyze miner submissions
-   - Score from 0-100 based on:
-     - Tests passing (20 points)
-     - Code quality/static analysis (15 points)
-     - Linting (15 points)
-     - Base points (50 points for valid submissions)
-
-4. **On-Chain Integration**
-   - Validator submits scores on-chain
-   - Bittensor's Yuma Consensus updates weights and allocates TAO rewards
-
-## Getting Started
-
-### Prerequisites
+### Requirements
 
 - Python 3.8+
 - Git
 - Bittensor
 
-### Installation
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/username/code-collaboration-subnet.git
-   cd code-collaboration-subnet
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -e .
-   ```
-
-### Storage System
-
-The subnet uses a simple yet robust JSON file-based storage system to track:
-- Challenge information and status
-- Submissions and their evaluation results
-- Repository paths and metadata
-
-This file-based approach eliminates database dependencies, making the subnet easier to deploy and maintain. The JSON files are stored in a designated directory and include file locking to prevent concurrent access issues.
-
-### Configuration
-
-Configure your subnet by modifying the `config.yaml` file:
-
-```yaml
-# Miner settings
-miner:
-  repo_directory: "~/miner_repos"
-
-# Validator settings
-validator:
-  repo_directory: "~/validator_repos"
-  challenge_repos: "https://github.com/org/repo1,https://github.com/org/repo2"
-  batch_size: 5
-  storage_dir: "storage"  # Directory for JSON storage files
+```bash
+# Install dependencies
+pip install -r requirements.txt
 ```
 
 ### Running a Miner
 
 ```bash
-python neurons/miner.py --subtensor.network <network> --wallet.name <wallet> --wallet.hotkey <hotkey>
+# Start miner 
+python neurons/miner.py --subtensor.network finney --wallet.name <your_wallet> --wallet.hotkey <your_hotkey>
 ```
 
 ### Running a Validator
 
 ```bash
-python neurons/validator.py --subtensor.network <network> --wallet.name <wallet> --wallet.hotkey <hotkey>
+# Start validator
+python neurons/validator.py --subtensor.network finney --wallet.name <your_wallet> --wallet.hotkey <your_hotkey>
 ```
 
-## Subnet Lifecycle
+## Key Components
 
-1. **Repository Management**
-   - Miners automatically clone specified repositories
-   - Updates are fetched regularly to keep repositories current
+- **Git Server**: HTTP server for Git protocol using Flask and waitress
+- **Performance Metrics**: Captures latency, bandwidth, and integrity for scoring
+- **Validator Scoring**: Uses weighted metrics to determine rewards
 
-2. **Challenge Cycle**
-   - Validators issue code challenges to random miners
-   - Miners accept challenges and develop solutions
-   - Solutions are submitted as branches
-   - Validators score solutions and update weights
+## Configuration
 
-3. **Scoring System**
-   - Code quality scores are normalized to a 0-1 range
-   - The Yuma Consensus mechanism distributes TAO rewards based on these normalized scores
+See `config.yaml` for subnet configuration options.
 
 ## Development
 
-### Storage System Implementation
+```bash
+# Run tests
+pytest tests/
 
-The JSON storage system consists of three main files:
-- `challenges.json`: Stores all challenge details and their status
-- `submissions.json`: Records submissions, scores, and evaluation results
-- `repositories.json`: Tracks repository locations and metadata
-
-The system includes file locking to prevent data corruption during concurrent access and automatic creation of storage files when they don't exist.
-
-### Adding New Challenge Types
-
-To add new challenge types:
-
-1. Update the `_generate_challenge_description` method in `validator.py`
-2. Add templates for the new challenge type
-3. Implement the validation logic in the `_calculate_solution_score` method
-
-### Custom Git Integrations
-
-For special Git operations:
-
-1. Add a new Synapse type in `protocol.py`
-2. Implement handler methods in the miner class
-3. Add client code in the validator class
+# Check code quality
+flake8 .
+```
 
 ## License
 
-MIT License - see the LICENSE file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+MIT

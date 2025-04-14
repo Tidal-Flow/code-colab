@@ -27,16 +27,18 @@ import subprocess
 import numpy as np
 import bittensor as bt
 import torch
+import psutil
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Tuple, Optional, Union
 
 # Import the code collaboration subnet module
-import ocr_subnet as code_subnet
-from ocr_subnet.utils.storage import JSONStorage
+import code_colab as code_subnet
+from code_colab.utils.storage import JSONStorage
+from code_colab.validator.reward import GitPerformanceMetrics
 
 # import base validator class which takes care of most of the boilerplate
-from ocr_subnet.base.validator import BaseValidatorNeuron
+from code_colab.base.validator import BaseValidatorNeuron
 
 
 class Validator(BaseValidatorNeuron):
@@ -61,6 +63,11 @@ class Validator(BaseValidatorNeuron):
             
         # Set up JSON storage instead of database
         self.setup_storage()
+        
+        # Initialize metrics collector
+        self.metrics = GitPerformanceMetrics(
+            metrics_dir=os.path.join(self.repo_dir, "metrics")
+        )
         
         # Verify Git is installed and working
         try:
@@ -94,26 +101,238 @@ class Validator(BaseValidatorNeuron):
         The forward function is called by the validator every time step.
         
         It consists of 3 main operations:
-        1. Generate code challenges for miners
-        2. Evaluate existing solutions
-        3. Score miners based on their submissions
+        1. Test miners for Git operations performance
+        2. Generate code challenges for miners
+        3. Score miners based on their Git performance and challenge responses
         """
         try:
             # Decide which operation to perform based on step count
             operation = self.step % 3
             
             if operation == 0:
-                # Generate and issue new code challenges to miners
-                await self._issue_code_challenges()
+                # Test miners' Git operations
+                await self._test_git_operations()
             elif operation == 1:
-                # Evaluate solutions that have been submitted but not yet scored
-                await self._evaluate_solutions()
+                # Generate and issue code challenges to miners
+                await self._issue_code_challenges()
             else:
-                # Update scores based on recent evaluations
+                # Update scores based on performance metrics
                 await self._update_miner_scores()
                 
         except Exception as e:
             bt.logging.error(f"Error in forward: {e}")
+    
+    async def _test_git_operations(self):
+        """Test miners' Git server performance with clone/fetch/push operations"""
+        bt.logging.info("Testing miners' Git operations")
+        
+        # Select random miners to test
+        miner_uids = code_subnet.utils.uids.get_random_uids(
+            self, 
+            k=min(self.config.neuron.sample_size, self.metagraph.n.item())
+        )
+        
+        if not miner_uids or len(miner_uids) == 0:
+            bt.logging.warning("No miners available to test")
+            return
+            
+        # Select a testing operation
+        operation_type = random.choice(["clone", "fetch", "push"])
+        bt.logging.info(f"Testing {operation_type} operation on {len(miner_uids)} miners")
+        
+        if operation_type == "clone":
+            await self._test_clone_operation(miner_uids)
+        elif operation_type == "fetch":
+            await self._test_fetch_operation(miner_uids)
+        elif operation_type == "push":
+            await self._test_push_operation(miner_uids)
+    
+    async def _test_clone_operation(self, miner_uids: List[int]):
+        """Test miners' Git clone performance"""
+        # Generate test repository parameters
+        repo_name = f"test-repo-{uuid.uuid4().hex[:8]}"
+        
+        # Prepare clone synapse
+        synapse = code_subnet.protocol.GitCloneSynapse(
+            repo_url=repo_name,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+            ref=None
+        )
+        
+        # Query miners
+        bt.logging.info(f"Sending clone request for {repo_name} to {len(miner_uids)} miners")
+        start_time = time.time()
+        
+        responses = await self.dendrite.query(
+            axons=[self.metagraph.axons[uid] for uid in miner_uids],
+            synapse=synapse,
+            deserialize=True,
+        )
+        
+        # Process responses and score miners
+        scores = []
+        for i, response in enumerate(responses):
+            if not response or not isinstance(response, dict) or "status" not in response:
+                bt.logging.warning(f"Invalid response from miner {miner_uids[i]}")
+                scores.append(0.0)
+                continue
+                
+            if response["status"] != "success":
+                bt.logging.info(f"Miner {miner_uids[i]} failed clone operation: {response.get('error', 'unknown error')}")
+                scores.append(0.0)
+                continue
+                
+            # Check if metrics are included
+            metrics = getattr(synapse, "metrics", None)
+            if metrics:
+                # Score based on metrics
+                operation_score = self.metrics.score_operation(metrics)
+                scores.append(operation_score)
+                bt.logging.info(f"Miner {miner_uids[i]} clone operation score: {operation_score:.4f}")
+            else:
+                # Score based on response time if no metrics
+                elapsed = time.time() - start_time
+                time_score = max(0.0, 1.0 - (elapsed / 30.0))  # 30 second timeout for ideal score
+                scores.append(time_score)
+                bt.logging.info(f"Miner {miner_uids[i]} clone time score: {time_score:.4f}")
+        
+        # Update scores in metagraph
+        for i, score in enumerate(scores):
+            if i < len(miner_uids):
+                uid = miner_uids[i]
+                self.scores[uid] = 0.9 * self.scores[uid] + 0.1 * score
+    
+    async def _test_fetch_operation(self, miner_uids: List[int]):
+        """Test miners' Git fetch performance"""
+        # First ensure a repository exists to fetch from
+        repo_name = f"test-repo-{uuid.uuid4().hex[:8]}"
+        
+        # Create repository on miners first
+        await self._test_clone_operation(miner_uids)
+        
+        # Prepare fetch synapse
+        synapse = code_subnet.protocol.GitFetchSynapse(
+            repo_url=repo_name,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+            ref=None
+        )
+        
+        # Query miners
+        bt.logging.info(f"Sending fetch request for {repo_name} to {len(miner_uids)} miners")
+        start_time = time.time()
+        
+        responses = await self.dendrite.query(
+            axons=[self.metagraph.axons[uid] for uid in miner_uids],
+            synapse=synapse,
+            deserialize=True,
+        )
+        
+        # Process responses and score miners
+        scores = []
+        for i, response in enumerate(responses):
+            if not response or not isinstance(response, dict) or "status" not in response:
+                bt.logging.warning(f"Invalid response from miner {miner_uids[i]}")
+                scores.append(0.0)
+                continue
+                
+            if response["status"] != "success":
+                bt.logging.info(f"Miner {miner_uids[i]} failed fetch operation: {response.get('error', 'unknown error')}")
+                scores.append(0.0)
+                continue
+                
+            # Check if metrics are included
+            metrics = getattr(synapse, "metrics", None)
+            if metrics:
+                # Score based on metrics
+                operation_score = self.metrics.score_operation(metrics)
+                scores.append(operation_score)
+                bt.logging.info(f"Miner {miner_uids[i]} fetch operation score: {operation_score:.4f}")
+            else:
+                # Score based on response time if no metrics
+                elapsed = time.time() - start_time
+                time_score = max(0.0, 1.0 - (elapsed / 10.0))  # 10 second timeout for ideal score (fetch should be faster than clone)
+                scores.append(time_score)
+                bt.logging.info(f"Miner {miner_uids[i]} fetch time score: {time_score:.4f}")
+        
+        # Update scores in metagraph
+        for i, score in enumerate(scores):
+            if i < len(miner_uids):
+                uid = miner_uids[i]
+                self.scores[uid] = 0.9 * self.scores[uid] + 0.1 * score
+    
+    async def _test_push_operation(self, miner_uids: List[int]):
+        """Test miners' Git push performance"""
+        # First ensure a repository exists to push to
+        repo_name = f"test-repo-{uuid.uuid4().hex[:8]}"
+        
+        # Create repository on miners first
+        await self._test_clone_operation(miner_uids)
+        
+        # Prepare push data - a small test file
+        commit_data = {
+            "message": f"Test commit {uuid.uuid4().hex[:8]}",
+            "files": {
+                "README.md": f"# Test Repository\n\nThis is a test repository created on {datetime.now().isoformat()}.\n",
+                "test.txt": f"This is a test file generated for push testing.\nRandom content: {uuid.uuid4().hex}\n"
+            }
+        }
+        
+        # Prepare push synapse
+        synapse = code_subnet.protocol.GitPushSynapse(
+            repo_url=repo_name,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+            branch="main",
+            commit_data=commit_data
+        )
+        
+        # Query miners
+        bt.logging.info(f"Sending push request for {repo_name} to {len(miner_uids)} miners")
+        start_time = time.time()
+        
+        responses = await self.dendrite.query(
+            axons=[self.metagraph.axons[uid] for uid in miner_uids],
+            synapse=synapse,
+            deserialize=True,
+        )
+        
+        # Process responses and score miners
+        scores = []
+        for i, response in enumerate(responses):
+            if not response or not isinstance(response, dict) or "status" not in response:
+                bt.logging.warning(f"Invalid response from miner {miner_uids[i]}")
+                scores.append(0.0)
+                continue
+                
+            if response["status"] != "success":
+                bt.logging.info(f"Miner {miner_uids[i]} failed push operation: {response.get('error', 'unknown error')}")
+                scores.append(0.0)
+                continue
+                
+            # Verify commit hash is returned
+            if "commit_hash" not in response:
+                bt.logging.warning(f"Miner {miner_uids[i]} did not return commit hash")
+                scores.append(0.5)  # Partial credit - operation worked but verification incomplete
+                continue
+                
+            # Check if metrics are included
+            metrics = getattr(synapse, "metrics", None)
+            if metrics:
+                # Score based on metrics
+                operation_score = self.metrics.score_operation(metrics)
+                scores.append(operation_score)
+                bt.logging.info(f"Miner {miner_uids[i]} push operation score: {operation_score:.4f}")
+            else:
+                # Score based on response time if no metrics
+                elapsed = time.time() - start_time
+                time_score = max(0.0, 1.0 - (elapsed / 15.0))  # 15 second timeout for ideal score
+                scores.append(time_score)
+                bt.logging.info(f"Miner {miner_uids[i]} push time score: {time_score:.4f}")
+        
+        # Update scores in metagraph
+        for i, score in enumerate(scores):
+            if i < len(miner_uids):
+                uid = miner_uids[i]
+                self.scores[uid] = 0.9 * self.scores[uid] + 0.1 * score
     
     async def _issue_code_challenges(self):
         """Generate and send code challenges to miners"""
@@ -135,42 +354,19 @@ class Validator(BaseValidatorNeuron):
         # Create a unique challenge ID
         challenge_id = str(uuid.uuid4())
         
-        # Check if we have this repo locally, if not clone it
-        repo_path = self._get_repo_path(repo_url)
-        if not repo_path:
-            repo_path = self._clone_repository(repo_url)
-            
-        # Get repo info including available branches
-        repo_info = self._get_repo_info(repo_path)
-        
         # Choose a base branch for the challenge
         base_branch = "main"  # Default to main
-        for branch in repo_info["branches"]:
-            if branch.strip() == "* main" or branch.strip() == "* master":
-                base_branch = branch.replace("* ", "").strip()
-                break
         
         # Generate a challenge based on the repository
         challenge_types = ["feature", "bugfix", "refactor", "test", "documentation"]
         challenge_type = random.choice(challenge_types)
         
-        challenge_description = self._generate_challenge_description(repo_path, challenge_type)
-        
-        # Store challenge in JSON storage
-        if self.storage:
-            expiry_time = (datetime.now() + timedelta(hours=24)).isoformat()
-            self.storage.store_challenge(
-                challenge_id=challenge_id,
-                repo_url=repo_url,
-                challenge_type=challenge_type,
-                description=challenge_description,
-                base_branch=base_branch,
-                expiry_at=expiry_time
-            )
+        challenge_description = self._generate_challenge_description(repo_url, challenge_type)
         
         # Create synapse with challenge details
         synapse = code_subnet.protocol.GitChallengeSynapse(
             repo_url=repo_url,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
             challenge_id=challenge_id,
             challenge_type=challenge_type,
             description=challenge_description,
@@ -185,6 +381,23 @@ class Validator(BaseValidatorNeuron):
             deserialize=True,
         )
         
+        # Store challenge in JSON storage
+        if self.storage:
+            self.storage.store_object(
+                object_type="challenge",
+                object_id=challenge_id,
+                data={
+                    "id": challenge_id,
+                    "repo_url": repo_url,
+                    "challenge_type": challenge_type,
+                    "description": challenge_description,
+                    "base_branch": base_branch,
+                    "status": "active",
+                    "created_at": datetime.now().isoformat(),
+                    "miners": miner_uids
+                }
+            )
+        
         # Log responses
         for i, response in enumerate(responses):
             if not response or not isinstance(response, dict):
@@ -196,207 +409,165 @@ class Validator(BaseValidatorNeuron):
                 
                 # Record acceptance in JSON storage
                 if self.storage:
-                    self.storage.store_submission(
-                        submission_id=str(uuid.uuid4()),
-                        challenge_id=challenge_id,
-                        hotkey=self.metagraph.hotkeys[miner_uids[i]],
-                        solution_branch=response.get("solution_branch")
+                    self.storage.store_object(
+                        object_type="submission",
+                        object_id=f"{challenge_id}_{miner_uids[i]}",
+                        data={
+                            "challenge_id": challenge_id,
+                            "miner_uid": miner_uids[i].item(),
+                            "miner_hotkey": self.metagraph.hotkeys[miner_uids[i]],
+                            "status": "accepted",
+                            "solution_branch": response.get("solution_branch"),
+                            "submitted_at": datetime.now().isoformat()
+                        }
                     )
             else:
-                bt.logging.warning(f"Miner {miner_uids[i]} did not accept challenge: {response}")
+                bt.logging.warning(f"Miner {miner_uids[i]} rejected or failed challenge: {response.get('error', 'unknown error')}")
     
-    async def _evaluate_solutions(self):
-        """Evaluate solutions submitted by miners"""
-        bt.logging.info("Evaluating miner solutions")
+    async def _update_miner_scores(self):
+        """Update miner scores based on Git performance metrics"""
+        bt.logging.info("Updating miner scores based on Git performance")
         
-        # Check if we have any pending submissions to evaluate
-        if not self.storage:
-            bt.logging.warning("No storage available")
-            return
-            
-        # Get pending submissions from storage
-        submissions = self.storage.get_pending_submissions(self.config.validator.batch_size)
+        # Get all miners to collect metrics from
+        miner_uids = list(range(self.metagraph.n.item()))
         
-        if not submissions:
-            bt.logging.info("No pending submissions to evaluate")
-            return
-            
-        bt.logging.info(f"Found {len(submissions)} submissions to evaluate")
+        # Select a subset for performance check
+        test_uids = random.sample(
+            miner_uids, 
+            min(self.config.neuron.sample_size, len(miner_uids))
+        )
         
-        # Process each submission
-        for submission in submissions:
-            submission_id = submission["submission_id"]
-            challenge_id = submission["challenge_id"]
-            hotkey = submission["hotkey"]
-            solution_branch = submission["solution_branch"]
-            repo_url = submission["repo_url"]
-            
-            bt.logging.info(f"Evaluating submission {submission_id} from {hotkey}")
-            
-            # Get UID for this hotkey
-            try:
-                uid = self.metagraph.hotkeys.index(hotkey)
-            except ValueError:
-                bt.logging.warning(f"Unknown hotkey {hotkey}")
-                continue
-                
-            # Get miner's axon
+        # Collect performance metrics
+        scores = {}
+        for uid in test_uids:
             axon = self.metagraph.axons[uid]
+            hotkey = self.metagraph.hotkeys[uid]
             
-            # Fetch the solution branch
-            repo_path = self._get_repo_path(repo_url)
-            if not repo_path:
-                repo_path = self._clone_repository(repo_url)
-                
-            # Create validation synapse
-            synapse = code_subnet.protocol.GitValidationSynapse(
-                repo_url=repo_url,
-                solution_branch=solution_branch,
-                challenge_id=challenge_id,
-                validation_type="all"  # Run all validation types (tests, lint, etc.)
+            # Create metrics collection synapse
+            synapse = code_subnet.protocol.PerformanceMetricsSynapse(
+                validator_hotkey=self.wallet.hotkey.ss58_address,
+                metric_type="git_operations",
+                timeframe="24h"  # Last 24 hours
             )
             
-            # Query the miner to get the solution
-            bt.logging.info(f"Fetching solution from miner {uid} for branch {solution_branch}")
+            # Query miner for metrics
+            bt.logging.info(f"Requesting performance metrics from miner {uid}")
             response = await self.dendrite.query(
                 axons=[axon],
                 synapse=synapse,
                 deserialize=True,
-                timeout=30  # Increase timeout for validation operations
             )
             
-            if not response or len(response) == 0 or not isinstance(response[0], dict):
-                bt.logging.warning(f"Invalid validation response from miner {uid}")
+            # Process response
+            if not response or not isinstance(response, dict) or response.get("status") != "success":
+                bt.logging.warning(f"Invalid or error response from miner {uid}")
+                scores[uid] = 0.2  # Minimum score for not providing metrics
                 continue
                 
-            validation_result = response[0]
+            # Extract scores
+            operation_scores = response.get("scores", {})
+            overall_score = operation_scores.get("overall", 0.0)
             
-            # Calculate score based on validation results
-            score = self._calculate_solution_score(validation_result)
-            
-            # Update submission with score and test results in storage
-            self.storage.update_submission_score(
-                submission_id=submission_id,
-                score=score,
-                test_results=validation_result
-            )
-            
-            bt.logging.info(f"Scored submission {submission_id} with score {score}")
-    
-    async def _update_miner_scores(self):
-        """Update miner scores based on their submissions"""
-        bt.logging.info("Updating miner scores")
-        
-        if not self.storage:
-            bt.logging.warning("No storage available")
-            return
-            
-        # Get average scores for each miner from evaluated submissions
-        miner_scores = self.storage.get_average_scores_by_hotkey()
-        
-        if not miner_scores:
-            bt.logging.info("No scored submissions found")
-            return
-            
-        # Create a tensor of zeros for all miners
-        updated_scores = torch.zeros_like(self.metagraph.S, dtype=torch.float32)
-        
-        # Update scores for miners with evaluations
-        for hotkey, avg_score in miner_scores.items():
-            try:
-                uid = self.metagraph.hotkeys.index(hotkey)
-                updated_scores[uid] = float(avg_score)
-                bt.logging.info(f"Miner {uid} ({hotkey}): score = {avg_score}")
-            except ValueError:
-                bt.logging.warning(f"Unknown hotkey {hotkey}")
-                continue
+            # Calculate combined score using weights from config
+            if "scores" in response and all(key in operation_scores for key in ["clone", "fetch", "push"]):
+                # Apply the weights from config
+                weights = self.config.validator.scoring_weights
                 
-        # Set minimum score for active miners
-        min_score = 0.1  # Minimum score for active miners
-        mask = torch.zeros_like(updated_scores)
-        for uid in range(len(self.metagraph.hotkeys)):
-            if self.metagraph.hotkeys[uid] in miner_scores:
-                mask[uid] = 1
-            elif self.metagraph.axons[uid].is_serving:
-                mask[uid] = min_score
+                weighted_score = (
+                    weights.availability * (1.0 if response.get("operation_count", 0) > 0 else 0.0) +
+                    weights.latency * operation_scores.get("overall", 0.0) +
+                    weights.throughput * operation_scores.get("overall", 0.0) +
+                    weights.integrity * 1.0  # Assume integrity is good if operations succeeded
+                )
+                
+                # Normalize score
+                total_weight = sum(weights.values()) - weights.security  # Security not measured here
+                if total_weight > 0:
+                    weighted_score = weighted_score / total_weight
+                    
+                scores[uid] = max(0.2, weighted_score)  # Minimum score of 0.2 for active miners
+            else:
+                # Use overall score if detailed scores not available
+                scores[uid] = max(0.2, overall_score)
+                
+            bt.logging.info(f"Miner {uid} performance score: {scores[uid]:.4f}")
         
-        # Apply the mask to ensure minimum scores for active miners
-        updated_scores = torch.max(updated_scores, mask)
-        
-        # Update weights
-        self.scores = updated_scores
+        # Update weights in metagraph
+        for uid, score in scores.items():
+            # Update with exponential moving average
+            alpha = 0.2  # Weight of the new score
+            self.scores[uid] = (1 - alpha) * self.scores[uid] + alpha * score
         
         # Set weights on the network
-        bt.logging.info(f"Setting weights based on updated scores")
+        bt.logging.info(f"Setting weights based on performance scores")
         self.set_weights()
     
-    def _generate_challenge_description(self, repo_path: str, challenge_type: str) -> str:
-        """Generate a description for a code challenge"""
-        # List of challenge templates by type
-        templates = {
-            "feature": [
-                "Implement a new feature that allows users to {action} {target}",
-                "Add functionality for {action} with proper error handling",
-                "Create a new component that provides {target} functionality"
-            ],
-            "bugfix": [
-                "Fix the bug where {target} fails when {action}",
-                "Address the issue with {target} that occurs during {action}",
-                "Resolve the error that happens when users {action}"
-            ],
-            "refactor": [
-                "Refactor the {target} code to improve performance",
-                "Restructure {target} to follow better coding practices",
-                "Improve the organization of {target} by applying {action}"
-            ],
-            "test": [
-                "Write comprehensive tests for the {target} functionality",
-                "Implement unit tests for {action} to ensure it works correctly",
-                "Create integration tests that verify {target} works with other components"
-            ],
-            "documentation": [
-                "Document the {target} API with clear examples",
-                "Create user documentation for the {action} feature",
-                "Update the README with instructions for using {target}"
+    def _generate_challenge_description(self, repo_url: str, challenge_type: str) -> str:
+        """
+        Generate a description for a code challenge
+        
+        This is simplified - in a real implementation, you might analyze the repository
+        to generate meaningful challenges based on actual code.
+        """
+        # Extract repository name from URL
+        repo_name = repo_url.split("/")[-1]
+        
+        # Base description template
+        description = f"# Code Challenge: {challenge_type.capitalize()} for {repo_name}\n\n"
+        
+        # General challenge instructions
+        description += f"You are tasked with implementing a {challenge_type} for the {repo_name} repository.\n\n"
+        
+        # Random challenge features based on type
+        if challenge_type == "feature":
+            features = [
+                "Add a caching layer to improve performance",
+                "Implement pagination for API endpoints",
+                "Add dark mode support to the UI",
+                "Create a new visualization component",
+                "Implement user authentication and authorization"
             ]
-        }
+            description += f"Feature request: {random.choice(features)}\n"
         
-        # Get files in repository to use as potential targets
-        files_output = subprocess.run(
-            ["git", "-C", repo_path, "ls-files"],
-            capture_output=True, text=True, check=True
-        ).stdout
+        elif challenge_type == "bugfix":
+            bugs = [
+                "Fix memory leak in the data processing module",
+                "Resolve race condition in concurrent operations",
+                "Fix incorrect error handling in API endpoints",
+                "Resolve UI rendering issues in mobile view",
+                "Fix data corruption issue in the persistence layer"
+            ]
+            description += f"Bug description: {random.choice(bugs)}\n"
         
-        files = [f for f in files_output.split("\n") if f.strip()]
+        elif challenge_type == "refactor":
+            refactors = [
+                "Improve code organization and modularity",
+                "Reduce code duplication across components",
+                "Improve type safety and error handling",
+                "Optimize performance bottlenecks",
+                "Improve readability and maintainability"
+            ]
+            description += f"Refactoring goal: {random.choice(refactors)}\n"
         
-        # Generate random actions and targets
-        actions = [
-            "searching", "filtering", "adding", "removing", "updating", 
-            "processing", "analyzing", "exporting", "importing", "configuring"
-        ]
+        elif challenge_type == "test":
+            tests = [
+                "Increase test coverage for core modules",
+                "Add integration tests for API endpoints",
+                "Implement performance benchmarks",
+                "Add UI component tests",
+                "Create end-to-end test suite"
+            ]
+            description += f"Testing objective: {random.choice(tests)}\n"
         
-        generic_targets = [
-            "user profiles", "data entries", "configuration settings", "API responses",
-            "input validation", "error handling", "database connections", "authentication",
-            "authorization", "file uploads", "notification system", "user interface",
-            "dashboard widgets", "search functionality", "request processing"
-        ]
-        
-        # Try to find a real file target if possible
-        target = random.choice(generic_targets)
-        if files:
-            file_target = random.choice(files)
-            if "." in file_target:  # Only use files, not directories
-                target = file_target
-        
-        # Get a template for the challenge type
-        template = random.choice(templates.get(challenge_type, templates["feature"]))
-        
-        # Fill in the template
-        description = template.format(
-            action=random.choice(actions),
-            target=target
-        )
+        elif challenge_type == "documentation":
+            docs = [
+                "Create comprehensive API documentation",
+                "Write developer setup guide",
+                "Document architecture and design decisions",
+                "Create user guides with examples",
+                "Document configuration options and best practices"
+            ]
+            description += f"Documentation task: {random.choice(docs)}\n"
         
         # Add more specific details based on challenge type
         if challenge_type == "feature":
@@ -411,102 +582,6 @@ class Validator(BaseValidatorNeuron):
             description += "\n\nDocumentation should include:\n- API reference\n- Usage examples\n- Configuration options\n- Common troubleshooting steps"
             
         return description
-    
-    def _calculate_solution_score(self, validation_result: Dict) -> float:
-        """Calculate a score from validation results"""
-        score = 50.0  # Base score
-        
-        # Test results
-        test_score = validation_result.get("test_score", 0)
-        score += test_score * 20  # Tests are worth up to 20 points
-        
-        # Lint score
-        lint_score = validation_result.get("lint_score", 0)
-        score += lint_score * 15  # Linting is worth up to 15 points
-        
-        # Code quality score
-        quality_score = validation_result.get("quality_score", 0)
-        score += quality_score * 15  # Code quality is worth up to 15 points
-        
-        # Normalize score to 0-1 range (we'll multiply by 100 later)
-        score = max(0, min(score, 100)) / 100.0
-        
-        return score
-    
-    def _get_repo_path(self, repo_url: str) -> Optional[str]:
-        """Get the local path for a repository"""
-        if self.storage:
-            # Try to get from storage first
-            path = self.storage.get_repository_path(repo_url)
-            if path:
-                return path
-        
-        # If not in storage, check if we can find it by URL hash
-        repo_hash = self._hash_repo_url(repo_url)
-        repo_path = os.path.join(self.repo_dir, repo_hash)
-        
-        if os.path.exists(repo_path) and os.path.isdir(repo_path):
-            # Add to storage if found
-            if self.storage:
-                self.storage.store_repository(repo_url, repo_path)
-            return repo_path
-            
-        return None
-    
-    def _hash_repo_url(self, repo_url: str) -> str:
-        """Create a filesystem-safe hash of the repository URL"""
-        # Simple hashing to avoid filesystem issues with URLs
-        return repo_url.replace('/', '_').replace(':', '_').replace('.', '_')
-    
-    def _clone_repository(self, repo_url: str) -> str:
-        """Clone a Git repository to the local storage"""
-        bt.logging.info(f"Cloning repository: {repo_url}")
-        
-        repo_hash = self._hash_repo_url(repo_url)
-        repo_path = os.path.join(self.repo_dir, repo_hash)
-        
-        # Clone the repository
-        os.makedirs(os.path.dirname(repo_path), exist_ok=True)
-        subprocess.run(
-            ["git", "clone", repo_url, repo_path],
-            check=True, capture_output=True, text=True
-        )
-        
-        # Add to storage
-        if self.storage:
-            self.storage.store_repository(repo_url, repo_path)
-            
-        return repo_path
-    
-    def _get_repo_info(self, repo_path: str) -> Dict[str, Any]:
-        """Get information about a repository"""
-        # Get branches
-        branch_output = subprocess.run(
-            ["git", "-C", repo_path, "branch", "-a"],
-            check=True, capture_output=True, text=True
-        ).stdout
-        
-        branches = [b.strip() for b in branch_output.split('\n') if b.strip()]
-        
-        # Get latest commit
-        commit_output = subprocess.run(
-            ["git", "-C", repo_path, "log", "-1", "--pretty=format:%H|%an|%at|%s"],
-            check=True, capture_output=True, text=True
-        ).stdout
-        
-        commit_parts = commit_output.split('|')
-        latest_commit = {
-            "hash": commit_parts[0] if len(commit_parts) > 0 else "",
-            "author": commit_parts[1] if len(commit_parts) > 1 else "",
-            "timestamp": commit_parts[2] if len(commit_parts) > 2 else "",
-            "message": commit_parts[3] if len(commit_parts) > 3 else ""
-        }
-        
-        return {
-            "branches": branches,
-            "latest_commit": latest_commit,
-            "local_path": repo_path
-        }
 
 # This is the main function, which runs the validator.
 if __name__ == "__main__":

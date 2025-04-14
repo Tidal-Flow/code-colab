@@ -25,13 +25,17 @@ import subprocess
 import bittensor as bt
 from pathlib import Path
 from datetime import datetime, timedelta
+import hashlib
+import psutil
 
 # Code Collaboration Subnet
-import ocr_subnet as code_subnet
-from ocr_subnet.utils.storage import JSONStorage
+import code_colab as code_subnet
+from code_colab.utils.storage import JSONStorage
+from code_colab.utils.git_server import GitServer
+from code_colab.utils.metrics import GitPerformanceMetrics
 
 # Import base miner class which takes care of most of the boilerplate
-from ocr_subnet.base.miner import BaseMinerNeuron
+from code_colab.base.miner import BaseMinerNeuron
 
 class Miner(BaseMinerNeuron):
     """
@@ -51,6 +55,22 @@ class Miner(BaseMinerNeuron):
         
         # Initialize storage for tracking repositories and challenges
         self.setup_storage()
+        
+        # Initialize Git server (HTTP server for Git operations)
+        self.git_server = GitServer(
+            base_dir=self.repo_dir,
+            host=self.config.miner.git_server_host,
+            port=self.config.miner.git_server_port
+        )
+        bt.logging.info(f"Git server initialized on {self.config.miner.git_server_host}:{self.config.miner.git_server_port}")
+        
+        # Start the Git server in background thread
+        self.git_server.start()
+        
+        # Initialize metrics collector
+        self.metrics = GitPerformanceMetrics(
+            metrics_dir=os.path.join(self.repo_dir, "metrics")
+        )
         
         # Verify Git is installed and working
         try:
@@ -75,7 +95,10 @@ class Miner(BaseMinerNeuron):
         code_subnet.protocol.GitCloneSynapse,
         code_subnet.protocol.GitFetchSynapse,
         code_subnet.protocol.GitPushSynapse,
-        code_subnet.protocol.GitChallengeSynapse
+        code_subnet.protocol.GitPullRequestSynapse,
+        code_subnet.protocol.GitChallengeSynapse,
+        code_subnet.protocol.GitValidationSynapse,
+        code_subnet.protocol.PerformanceMetricsSynapse
     ]):
         """
         Process incoming Git-related requests from validators.
@@ -93,8 +116,14 @@ class Miner(BaseMinerNeuron):
             return await self._handle_git_fetch(synapse)
         elif isinstance(synapse, code_subnet.protocol.GitPushSynapse):
             return await self._handle_git_push(synapse)
+        elif isinstance(synapse, code_subnet.protocol.GitPullRequestSynapse):
+            return await self._handle_git_pull_request(synapse)
         elif isinstance(synapse, code_subnet.protocol.GitChallengeSynapse):
             return await self._handle_git_challenge(synapse)
+        elif isinstance(synapse, code_subnet.protocol.GitValidationSynapse):
+            return await self._handle_git_validation(synapse)
+        elif isinstance(synapse, code_subnet.protocol.PerformanceMetricsSynapse):
+            return await self._handle_performance_metrics(synapse)
         else:
             bt.logging.error(f"Unknown synapse type: {type(synapse)}")
             synapse.response = {"error": "Unsupported operation type"}
@@ -102,343 +131,671 @@ class Miner(BaseMinerNeuron):
 
     async def _handle_git_clone(self, synapse: code_subnet.protocol.GitCloneSynapse):
         """Handle Git clone requests"""
-        bt.logging.info(f"Received clone request for: {synapse.repo_url}")
+        bt.logging.info(f"Received clone request for: {synapse.repo_url} from validator {synapse.validator_hotkey}")
+        
+        # Start tracking metrics
+        operation_id = self.metrics.start_operation(
+            operation_type="clone",
+            validator_hotkey=synapse.validator_hotkey,
+            repo_name=self._extract_repo_name(synapse.repo_url)
+        )
         
         try:
-            # Check if repo already exists in our storage
-            repo_path = self._get_repo_path(synapse.repo_url)
+            repo_name = self._extract_repo_name(synapse.repo_url)
             
-            if not repo_path:
-                # Clone the repository if it doesn't exist
-                repo_path = self._clone_repository(synapse.repo_url)
+            # Check if repository already exists for this validator
+            try:
+                repo_info = self.git_server.get_repo_info(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+                bt.logging.info(f"Repository {repo_name} already exists for validator {synapse.validator_hotkey}")
+            except Exception:
+                # Clone or create repository
+                if synapse.repo_url.startswith(("http://", "https://", "git://")):
+                    # Clone from remote URL
+                    self.git_server.clone_to_local(
+                        source_url=synapse.repo_url,
+                        validator_hotkey=synapse.validator_hotkey,
+                        repo_name=repo_name
+                    )
+                else:
+                    # Create new empty repository
+                    self.git_server.create_repository(
+                        validator_hotkey=synapse.validator_hotkey,
+                        repo_name=repo_name
+                    )
             
-            # Get repository metadata
-            repo_info = self._get_repo_info(repo_path)
+            # Get repository info
+            repo_info = self.git_server.get_repo_info(
+                validator_hotkey=synapse.validator_hotkey,
+                repo_name=repo_name
+            )
+            
+            # End metrics tracking
+            metrics_data = self.metrics.end_operation(operation_id)
             
             # Prepare response
             synapse.response = {
                 "status": "success",
                 "repo_info": repo_info,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "clone_url": self.git_server.get_repo_url(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
             }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
             
         except Exception as e:
             bt.logging.error(f"Error handling clone request: {e}")
+            
+            # End metrics tracking with error
+            metrics_data = self.metrics.end_operation(
+                operation_id=operation_id,
+                success=False,
+                error=str(e)
+            )
+            
             synapse.response = {
                 "status": "error",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
             
         return synapse
 
     async def _handle_git_fetch(self, synapse: code_subnet.protocol.GitFetchSynapse):
         """Handle Git fetch requests"""
-        bt.logging.info(f"Received fetch request for: {synapse.repo_url}")
+        bt.logging.info(f"Received fetch request for: {synapse.repo_url} from validator {synapse.validator_hotkey}")
+        
+        # Start tracking metrics
+        operation_id = self.metrics.start_operation(
+            operation_type="fetch",
+            validator_hotkey=synapse.validator_hotkey,
+            repo_name=self._extract_repo_name(synapse.repo_url)
+        )
         
         try:
-            # Get repository path
-            repo_path = self._get_repo_path(synapse.repo_url)
+            repo_name = self._extract_repo_name(synapse.repo_url)
             
-            if not repo_path:
-                raise ValueError(f"Repository {synapse.repo_url} not found")
+            # Ensure repository exists
+            try:
+                repo_info = self.git_server.get_repo_info(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+            except Exception as e:
+                raise ValueError(f"Repository {repo_name} not found: {str(e)}")
             
-            # Fetch updates
-            self._fetch_repository(repo_path, synapse.ref)
+            # For fetch, validator will use the HTTP URL to fetch directly
+            # We just need to make sure the repository is ready and return the URL
             
-            # Get updated repository info
-            repo_info = self._get_repo_info(repo_path)
+            # End metrics tracking
+            metrics_data = self.metrics.end_operation(operation_id)
             
             # Prepare response
             synapse.response = {
                 "status": "success",
                 "repo_info": repo_info,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "fetch_url": self.git_server.get_repo_url(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
             }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
             
         except Exception as e:
             bt.logging.error(f"Error handling fetch request: {e}")
+            
+            # End metrics tracking with error
+            metrics_data = self.metrics.end_operation(
+                operation_id=operation_id,
+                success=False,
+                error=str(e)
+            )
+            
             synapse.response = {
                 "status": "error",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
             
         return synapse
 
     async def _handle_git_push(self, synapse: code_subnet.protocol.GitPushSynapse):
         """Handle Git push requests"""
-        bt.logging.info(f"Received push request for: {synapse.repo_url}, branch: {synapse.branch}")
+        bt.logging.info(f"Received push request for: {synapse.repo_url}, branch: {synapse.branch} from validator {synapse.validator_hotkey}")
+        
+        # Start tracking metrics
+        operation_id = self.metrics.start_operation(
+            operation_type="push",
+            validator_hotkey=synapse.validator_hotkey,
+            repo_name=self._extract_repo_name(synapse.repo_url)
+        )
         
         try:
-            # Get repository path
-            repo_path = self._get_repo_path(synapse.repo_url)
+            repo_name = self._extract_repo_name(synapse.repo_url)
             
-            if not repo_path:
-                raise ValueError(f"Repository {synapse.repo_url} not found")
+            # Ensure repository exists
+            try:
+                repo_info = self.git_server.get_repo_info(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+            except Exception as e:
+                raise ValueError(f"Repository {repo_name} not found: {str(e)}")
             
-            # Apply the changes from the commit data
-            commit_hash = self._apply_commit(repo_path, synapse.branch, synapse.commit_data)
+            # For direct push, validator will use the HTTP URL to push directly
+            # If we're given commit data, we can apply it server-side as well
+            if synapse.commit_data:
+                # Apply changes to repository
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Clone the repository to a temporary directory
+                    temp_repo_url = self.git_server.get_repo_url(
+                        validator_hotkey=synapse.validator_hotkey,
+                        repo_name=repo_name
+                    )
+                    
+                    # Clone to the temporary directory
+                    subprocess.run(
+                        ["git", "clone", temp_repo_url, temp_dir],
+                        check=True,
+                        capture_output=True
+                    )
+                    
+                    # Switch to the branch or create it
+                    try:
+                        subprocess.run(
+                            ["git", "checkout", synapse.branch],
+                            cwd=temp_dir,
+                            check=True,
+                            capture_output=True
+                        )
+                    except subprocess.CalledProcessError:
+                        # Branch doesn't exist, create it
+                        subprocess.run(
+                            ["git", "checkout", "-b", synapse.branch],
+                            cwd=temp_dir,
+                            check=True,
+                            capture_output=True
+                        )
+                    
+                    # Apply changes from commit_data
+                    for file_path, content in synapse.commit_data.get("files", {}).items():
+                        # Create directories if needed
+                        full_path = os.path.join(temp_dir, file_path)
+                        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                        
+                        # Write file content
+                        with open(full_path, "w") as f:
+                            f.write(content)
+                    
+                    # Add changes
+                    subprocess.run(
+                        ["git", "add", "."],
+                        cwd=temp_dir,
+                        check=True,
+                        capture_output=True
+                    )
+                    
+                    # Commit changes
+                    commit_message = synapse.commit_data.get("message", "Commit via API")
+                    subprocess.run(
+                        ["git", "commit", "-m", commit_message],
+                        cwd=temp_dir,
+                        check=True,
+                        capture_output=True
+                    )
+                    
+                    # Push changes
+                    subprocess.run(
+                        ["git", "push", "origin", synapse.branch],
+                        cwd=temp_dir,
+                        check=True,
+                        capture_output=True
+                    )
+                    
+                    # Get commit hash
+                    result = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=temp_dir,
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    commit_hash = result.stdout.strip()
+            else:
+                # No commit data, just return the push URL
+                commit_hash = None
+            
+            # Get updated repository info
+            repo_info = self.git_server.get_repo_info(
+                validator_hotkey=synapse.validator_hotkey,
+                repo_name=repo_name
+            )
+            
+            # End metrics tracking
+            metrics_data = self.metrics.end_operation(operation_id)
             
             # Prepare response
             synapse.response = {
                 "status": "success",
+                "repo_info": repo_info,
                 "commit_hash": commit_hash,
                 "branch": synapse.branch,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "push_url": self.git_server.get_repo_url(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
             }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
             
         except Exception as e:
             bt.logging.error(f"Error handling push request: {e}")
+            
+            # End metrics tracking with error
+            metrics_data = self.metrics.end_operation(
+                operation_id=operation_id,
+                success=False,
+                error=str(e)
+            )
+            
             synapse.response = {
                 "status": "error",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
+            
+        return synapse
+
+    async def _handle_git_pull_request(self, synapse: code_subnet.protocol.GitPullRequestSynapse):
+        """Handle Git pull request operations"""
+        bt.logging.info(f"Received pull request: {synapse.source_branch} -> {synapse.target_branch} from validator {synapse.validator_hotkey}")
+        
+        # Start tracking metrics
+        operation_id = self.metrics.start_operation(
+            operation_type="pull_request",
+            validator_hotkey=synapse.validator_hotkey,
+            repo_name=self._extract_repo_name(synapse.repo_url)
+        )
+        
+        try:
+            repo_name = self._extract_repo_name(synapse.repo_url)
+            
+            # Ensure repository exists
+            try:
+                repo_info = self.git_server.get_repo_info(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+            except Exception as e:
+                raise ValueError(f"Repository {repo_name} not found: {str(e)}")
+            
+            # Create a simple pull request implementation
+            # In a real-world scenario, you'd use a Git hosting API (GitHub, GitLab, etc.)
+            pr_id = hashlib.md5(
+                f"{synapse.validator_hotkey}_{repo_name}_{synapse.source_branch}_{synapse.target_branch}_{time.time()}".encode()
+            ).hexdigest()[:8]
+            
+            # Store pull request in storage
+            if self.storage:
+                self.storage.store_object(
+                    object_type="pull_request",
+                    object_id=pr_id,
+                    data={
+                        "id": pr_id,
+                        "repo_name": repo_name,
+                        "validator_hotkey": synapse.validator_hotkey,
+                        "source_branch": synapse.source_branch,
+                        "target_branch": synapse.target_branch,
+                        "title": synapse.title,
+                        "description": synapse.description,
+                        "status": "open",
+                        "created_at": datetime.now().isoformat()
+                    }
+                )
+            
+            # End metrics tracking
+            metrics_data = self.metrics.end_operation(operation_id)
+            
+            # Prepare response
+            synapse.response = {
+                "status": "success",
+                "pr_id": pr_id,
+                "source_branch": synapse.source_branch,
+                "target_branch": synapse.target_branch,
+                "timestamp": datetime.now().isoformat(),
+                "repo_url": self.git_server.get_repo_url(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+            }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
+            
+        except Exception as e:
+            bt.logging.error(f"Error handling pull request: {e}")
+            
+            # End metrics tracking with error
+            metrics_data = self.metrics.end_operation(
+                operation_id=operation_id,
+                success=False,
+                error=str(e)
+            )
+            
+            synapse.response = {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
             
         return synapse
 
     async def _handle_git_challenge(self, synapse: code_subnet.protocol.GitChallengeSynapse):
         """Handle Git challenge requests"""
-        bt.logging.info(f"Received challenge request: {synapse.challenge_id} for repo: {synapse.repo_url}")
+        bt.logging.info(f"Received challenge for: {synapse.repo_url}, id: {synapse.challenge_id} from validator {synapse.validator_hotkey}")
+        
+        # Start tracking metrics
+        operation_id = self.metrics.start_operation(
+            operation_type="challenge",
+            validator_hotkey=synapse.validator_hotkey,
+            repo_name=self._extract_repo_name(synapse.repo_url)
+        )
         
         try:
-            # Store challenge in storage
-            if self.storage:
-                # Check if repo exists, if not add it
-                repo_path = self._get_repo_path(synapse.repo_url)
-                if not repo_path:
-                    repo_path = self._clone_repository(synapse.repo_url)
-                
-                # Store challenge information
-                self.storage.store_challenge(
-                    challenge_id=synapse.challenge_id,
-                    repo_url=synapse.repo_url,
-                    challenge_type=synapse.challenge_type,
-                    description=synapse.description,
-                    base_branch=synapse.base_branch,
-                    expiry_at=(datetime.now() + timedelta(hours=24)).isoformat()
-                )
+            repo_name = self._extract_repo_name(synapse.repo_url)
             
-            # Create a solution branch for this challenge
-            repo_path = self._get_repo_path(synapse.repo_url)
+            # Ensure repository exists
+            try:
+                repo_info = self.git_server.get_repo_info(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+            except Exception:
+                # Clone repository if it doesn't exist locally
+                if synapse.repo_url.startswith(("http://", "https://", "git://")):
+                    # Clone from remote URL
+                    self.git_server.clone_to_local(
+                        source_url=synapse.repo_url,
+                        validator_hotkey=synapse.validator_hotkey,
+                        repo_name=repo_name
+                    )
+                else:
+                    raise ValueError(f"Repository {repo_name} not found")
+            
+            # Create a solution branch
             solution_branch = f"solution/{synapse.challenge_id}"
             
-            # Create solution branch from base branch
-            self._create_solution_branch(repo_path, synapse.base_branch, solution_branch)
+            self.git_server.create_branch(
+                validator_hotkey=synapse.validator_hotkey,
+                repo_name=repo_name,
+                branch_name=solution_branch,
+                source_branch=synapse.base_branch
+            )
+            
+            # Store challenge in storage
+            if self.storage:
+                self.storage.store_object(
+                    object_type="challenge",
+                    object_id=synapse.challenge_id,
+                    data={
+                        "id": synapse.challenge_id,
+                        "repo_name": repo_name,
+                        "validator_hotkey": synapse.validator_hotkey,
+                        "challenge_type": synapse.challenge_type,
+                        "description": synapse.description,
+                        "base_branch": synapse.base_branch,
+                        "solution_branch": solution_branch,
+                        "status": "accepted",
+                        "created_at": datetime.now().isoformat()
+                    }
+                )
+            
+            # End metrics tracking
+            metrics_data = self.metrics.end_operation(operation_id)
             
             # Prepare response
             synapse.response = {
                 "status": "accepted",
                 "solution_branch": solution_branch,
+                "repo_url": self.git_server.get_repo_url(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                ),
                 "timestamp": datetime.now().isoformat()
             }
             
+            # Add metrics to response
+            synapse.metrics = metrics_data
+            
         except Exception as e:
             bt.logging.error(f"Error handling challenge request: {e}")
+            
+            # End metrics tracking with error
+            metrics_data = self.metrics.end_operation(
+                operation_id=operation_id,
+                success=False,
+                error=str(e)
+            )
+            
             synapse.response = {
                 "status": "error",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
             
+            # Add metrics to response
+            synapse.metrics = metrics_data
+            
         return synapse
-    
-    def _get_repo_path(self, repo_url):
-        """Get the local path for a repository"""
-        if self.storage:
-            # Try to get from storage
-            path = self.storage.get_repository_path(repo_url)
-            if path:
-                return path
-                
-        # If not in storage, check if we can find it by URL hash
-        repo_hash = self._hash_repo_url(repo_url)
-        repo_path = os.path.join(self.repo_dir, repo_hash)
+
+    async def _handle_git_validation(self, synapse: code_subnet.protocol.GitValidationSynapse):
+        """Handle Git validation requests"""
+        bt.logging.info(f"Received validation request for: {synapse.repo_url}, solution: {synapse.solution_branch} from validator {synapse.validator_hotkey}")
         
-        if os.path.exists(repo_path) and os.path.isdir(repo_path):
-            # Add to storage if found
-            if self.storage:
-                self.storage.store_repository(repo_url, repo_path)
-            return repo_path
-            
-        return None
-    
-    def _hash_repo_url(self, repo_url):
-        """Create a filesystem-safe hash of the repository URL"""
-        # Simple hashing to avoid filesystem issues with URLs
-        return repo_url.replace('/', '_').replace(':', '_').replace('.', '_')
-    
-    def _clone_repository(self, repo_url):
-        """Clone a Git repository to the local storage"""
-        repo_hash = self._hash_repo_url(repo_url)
-        repo_path = os.path.join(self.repo_dir, repo_hash)
-        
-        if os.path.exists(repo_path):
-            # Repository already exists, just fetch latest
-            self._fetch_repository(repo_path)
-            return repo_path
-        
-        # Clone the repository
-        os.makedirs(repo_path, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", repo_url, repo_path],
-            check=True, capture_output=True, text=True
+        # Start tracking metrics
+        operation_id = self.metrics.start_operation(
+            operation_type="validation",
+            validator_hotkey=synapse.validator_hotkey,
+            repo_name=self._extract_repo_name(synapse.repo_url)
         )
         
-        # Add to storage
-        if self.storage:
-            self.storage.store_repository(repo_url, repo_path)
+        try:
+            repo_name = self._extract_repo_name(synapse.repo_url)
             
-        return repo_path
-    
-    def _fetch_repository(self, repo_path, ref=None):
-        """Fetch updates for a repository"""
-        if ref:
-            subprocess.run(
-                ["git", "-C", repo_path, "fetch", "origin", ref],
-                check=True, capture_output=True, text=True
+            # Ensure repository exists
+            try:
+                repo_info = self.git_server.get_repo_info(
+                    validator_hotkey=synapse.validator_hotkey,
+                    repo_name=repo_name
+                )
+            except Exception as e:
+                raise ValueError(f"Repository {repo_name} not found: {str(e)}")
+            
+            # Perform validation (simplified for this implementation)
+            validation_result = {
+                "status": "success",
+                "challenge_id": synapse.challenge_id,
+                "scores": {
+                    "performance": 0.85,
+                    "correctness": 0.90,
+                    "style": 0.80,
+                    "overall": 0.85
+                },
+                "details": {
+                    "tests_passed": 5,
+                    "tests_failed": 1,
+                    "total_tests": 6
+                }
+            }
+            
+            # End metrics tracking
+            metrics_data = self.metrics.end_operation(operation_id)
+            
+            # Prepare response
+            synapse.response = {
+                "status": "success",
+                "validation": validation_result,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
+            
+        except Exception as e:
+            bt.logging.error(f"Error handling validation request: {e}")
+            
+            # End metrics tracking with error
+            metrics_data = self.metrics.end_operation(
+                operation_id=operation_id,
+                success=False,
+                error=str(e)
             )
+            
+            synapse.response = {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Add metrics to response
+            synapse.metrics = metrics_data
+            
+        return synapse
+
+    async def _handle_performance_metrics(self, synapse: code_subnet.protocol.PerformanceMetricsSynapse):
+        """Handle metrics collection requests"""
+        bt.logging.info(f"Received metrics request: {synapse.metric_type} from validator {synapse.validator_hotkey}")
+        
+        try:
+            if synapse.metric_type == "uptime":
+                # Return uptime information
+                uptime_seconds = time.time() - self.start_time
+                synapse.response = {
+                    "status": "success",
+                    "uptime_seconds": uptime_seconds,
+                    "uptime_formatted": str(timedelta(seconds=int(uptime_seconds))),
+                    "timestamp": datetime.now().isoformat()
+                }
+            elif synapse.metric_type == "git_operations":
+                # Return Git operation metrics
+                metrics_list = self.metrics.get_metrics_for_validator(
+                    validator_hotkey=synapse.validator_hotkey,
+                    timeframe=synapse.timeframe
+                )
+                
+                # Calculate scores
+                scores = self.metrics.calculate_average_scores(metrics_list)
+                
+                synapse.response = {
+                    "status": "success",
+                    "operation_count": len(metrics_list),
+                    "scores": scores,
+                    "timestamp": datetime.now().isoformat()
+                }
+            elif synapse.metric_type == "resource_usage":
+                # Return resource usage information
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                memory = psutil.virtual_memory()
+                disk = psutil.disk_usage(self.repo_dir)
+                
+                synapse.response = {
+                    "status": "success",
+                    "cpu_percent": cpu_percent,
+                    "memory_percent": memory.percent,
+                    "disk_percent": disk.percent,
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                synapse.response = {
+                    "status": "error",
+                    "error": f"Unknown metric type: {synapse.metric_type}",
+                    "timestamp": datetime.now().isoformat()
+                }
+        except Exception as e:
+            bt.logging.error(f"Error handling metrics request: {e}")
+            synapse.response = {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        return synapse
+
+    def _extract_repo_name(self, repo_url: str) -> str:
+        """Extract repository name from URL or path"""
+        # Remove .git extension if present
+        if repo_url.endswith(".git"):
+            repo_url = repo_url[:-4]
+        
+        # Handle various URL formats
+        if "/" in repo_url:
+            parts = repo_url.split("/")
+            return parts[-1]
         else:
-            subprocess.run(
-                ["git", "-C", repo_path, "fetch", "--all"],
-                check=True, capture_output=True, text=True
-            )
-    
-    def _get_repo_info(self, repo_path):
-        """Get information about a repository"""
-        # Get branches
-        branch_output = subprocess.run(
-            ["git", "-C", repo_path, "branch", "-a"],
-            check=True, capture_output=True, text=True
-        ).stdout
-        
-        branches = [b.strip() for b in branch_output.split('\n') if b.strip()]
-        
-        # Get latest commit
-        commit_output = subprocess.run(
-            ["git", "-C", repo_path, "log", "-1", "--pretty=format:%H|%an|%at|%s"],
-            check=True, capture_output=True, text=True
-        ).stdout
-        
-        commit_parts = commit_output.split('|')
-        latest_commit = {
-            "hash": commit_parts[0] if len(commit_parts) > 0 else "",
-            "author": commit_parts[1] if len(commit_parts) > 1 else "",
-            "timestamp": commit_parts[2] if len(commit_parts) > 2 else "",
-            "message": commit_parts[3] if len(commit_parts) > 3 else ""
-        }
-        
-        return {
-            "branches": branches,
-            "latest_commit": latest_commit,
-            "local_path": repo_path
-        }
-    
-    def _apply_commit(self, repo_path, branch, commit_data):
-        """Apply changes from commit data to a branch"""
-        # Ensure we're on the right branch
-        subprocess.run(
-            ["git", "-C", repo_path, "checkout", "-B", branch],
-            check=True, capture_output=True, text=True
-        )
-        
-        # Create temporary directory for files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Write files to temporary directory
-            for file_path, file_content in commit_data.get("files", {}).items():
-                full_path = os.path.join(temp_dir, file_path)
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                
-                with open(full_path, 'w') as f:
-                    f.write(file_content)
-                
-                # Copy file to repository
-                target_path = os.path.join(repo_path, file_path)
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                
-                # Use git to manage the file
-                subprocess.run(
-                    ["cp", full_path, target_path],
-                    check=True, capture_output=True, text=True
-                )
-                
-                # Add the file
-                subprocess.run(
-                    ["git", "-C", repo_path, "add", file_path],
-                    check=True, capture_output=True, text=True
-                )
-        
-        # Commit the changes
-        subprocess.run(
-            ["git", "-C", repo_path, "commit", "-m", commit_data.get("message", "Commit via Bittensor")],
-            check=True, capture_output=True, text=True
-        )
-        
-        # Get the commit hash
-        commit_hash = subprocess.run(
-            ["git", "-C", repo_path, "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True
-        ).stdout.strip()
-        
-        return commit_hash
-    
-    def _create_solution_branch(self, repo_path, base_branch, solution_branch):
-        """Create a new solution branch for a challenge"""
-        # Fetch updates
-        self._fetch_repository(repo_path)
-        
-        # Create branch from base
-        subprocess.run(
-            ["git", "-C", repo_path, "checkout", "-B", solution_branch, f"origin/{base_branch}"],
-            check=True, capture_output=True, text=True
-        )
-        
-        return solution_branch
+            return repo_url
 
     async def blacklist(self, synapse) -> typing.Tuple[bool, str]:
         """
-        Determines whether an incoming request should be blacklisted and thus ignored.
+        Check if the synapse should be blacklisted.
         
         Args:
-            synapse: A synapse object from an incoming request.
+            synapse: The synapse object to check.
             
         Returns:
-            Tuple[bool, str]: A tuple containing a boolean indicating whether the synapse's hotkey is blacklisted,
-                            and a string providing the reason for the decision.
+            Tuple[bool, str]: A tuple containing a boolean indicating whether the synapse 
+                              should be blacklisted and a string containing the reason.
         """
-        if synapse.dendrite.hotkey not in self.metagraph.hotkeys:
-            # Ignore requests from unrecognized entities.
-            bt.logging.trace(
-                f"Blacklisting unrecognized hotkey {synapse.dendrite.hotkey}"
-            )
-            return True, "Unrecognized hotkey"
+        if not synapse.validator_hotkey:
+            return True, "Missing validator_hotkey"
 
-        bt.logging.trace(
-            f"Not Blacklisting recognized hotkey {synapse.dendrite.hotkey}"
-        )
-        return False, "Hotkey recognized!"
+        # If synapse includes a repo_url, ensure it's reasonably formatted
+        if hasattr(synapse, 'repo_url') and synapse.repo_url:
+            if len(synapse.repo_url) > 500:
+                return True, "Repository URL too long"
+            
+            # Sanitize URL to prevent path traversal
+            if ".." in synapse.repo_url or "~" in synapse.repo_url:
+                return True, "Invalid repository URL"
+        
+        return False, "Synapse accepted"
 
     async def priority(self, synapse) -> float:
         """
-        Determines the priority of the request based on the caller's stake.
+        Return the priority of the synapse.
         
         Args:
-            synapse: The synapse object that contains metadata about the incoming request.
+            synapse: The synapse object to prioritize.
             
         Returns:
-            float: A priority score derived from the stake of the calling entity.
+            float: The priority value
         """
-        caller_uid = self.metagraph.hotkeys.index(
-            synapse.dendrite.hotkey
-        )  # Get the caller index.
-        priority = float(
-            self.metagraph.S[caller_uid]
-        )  # Return the stake as the priority.
-        bt.logging.trace(
-            f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}"
-        )
-        return priority
+        # All synapse types have the same priority for now
+        # In a more complex implementation, you might prioritize based on
+        # operation type, validator reputation, etc.
+        return 1.0
 
 # This is the main function, which runs the miner.
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ with open(path.join(here, "README.md"), encoding="utf-8") as f:
 
 # loading version from setup.py
 with codecs.open(
-    os.path.join(here, "ocr_subnet/__init__.py"), encoding="utf-8"
+    os.path.join(here, "code_colab/__init__.py"), encoding="utf-8"
 ) as init_file:
     version_match = re.search(
         r"^__version__ = ['\"]([^'\"]*)['\"]", init_file.read(), re.M
@@ -61,12 +61,12 @@ with codecs.open(
     version_string = version_match.group(1)
 
 setup(
-    name="ocr_subnet",
+    name="code_colab",
     version=version_string,
     description="Bittensor OCR subnet tutorial",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/steffencruz/ocr_subnet",
+    url="https://github.com/steffencruz/code_colab",
     author="bittensor.com",  
     packages=find_packages(),
     include_package_data=True,

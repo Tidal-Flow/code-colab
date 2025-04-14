@@ -13,6 +13,8 @@ miner:
   repo_directory: "~/miner_repos"  # Directory to store repositories
   max_repositories: 20             # Maximum number of repositories to host
   challenge_timeout: 3600          # Time (in seconds) to solve a challenge
+  git_server_host: "0.0.0.0"       # Host to bind Git HTTP server
+  git_server_port: 8092            # Port for Git HTTP server
   
 # Validator settings
 validator:
@@ -21,6 +23,12 @@ validator:
   batch_size: 5                        # Number of submissions to evaluate in one batch
   evaluation_timeout: 300              # Timeout for evaluation operations
   storage_dir: "storage"               # Directory for JSON storage files (relative to repo_directory)
+  scoring_weights:                     # Weights for different scoring criteria
+    availability: 0.20                 # Uptime during CRUD tests
+    latency: 0.20                     # Time to complete clone/fetch/push
+    integrity: 0.25                   # Hash-level consistency of commits and refs
+    throughput: 0.20                  # Bandwidth sustained during large transfers
+    security: 0.15                    # Proper TLS, auth checks on pushes
 
 # Logging settings
 logging:
